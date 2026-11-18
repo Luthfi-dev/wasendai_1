@@ -71,7 +71,7 @@ function loadEncryptedLocalDb(): LocalDatabase | null {
       antiBan: parsed.antiBan ? { ...DEFAULT_ANTIBAN, ...parsed.antiBan } : DEFAULT_ANTIBAN,
       users: parsed.users.map(u => ({ ...u, max_sessions: 1 })),
       plans: (Array.isArray(parsed.plans) && parsed.plans.length > 0 ? parsed.plans : DEFAULT_SUBSCRIPTION_PLANS).map(
-        p => ({ ...p, max_sessions: 1 })
+        normalizeSubscriptionPlan
       ),
       smtpAccounts: Array.isArray(parsed.smtpAccounts) ? parsed.smtpAccounts : [],
       geminiKeys: Array.isArray(parsed.geminiKeys) ? parsed.geminiKeys : [],
@@ -374,7 +374,7 @@ export function replaceRuntimeDatabaseFromMysql(remote: any): void {
       };
     }
     if (Array.isArray(remote.kvMap.plans) && remote.kvMap.plans.length > 0) {
-      db.plans = remote.kvMap.plans.map((p: SubscriptionPlan) => ({ ...p, max_sessions: 1 }));
+      db.plans = remote.kvMap.plans.map((p: SubscriptionPlan) => normalizeSubscriptionPlan(p));
     }
     if (remote.kvMap.antiBan) {
       db.antiBan = { ...db.antiBan, ...remote.kvMap.antiBan };
@@ -558,14 +558,14 @@ export const DEFAULT_SUBSCRIPTION_PLANS: SubscriptionPlan[] = [
     max_sessions: 1,
     daily_msg_limit: 100,
     monthly_msg_limit: 500,
-    daily_ai_limit: 25,
-    monthly_ai_limit: 250,
+    daily_ai_limit: 100,
+    monthly_ai_limit: 500,
     is_active: true,
     features: [
       '1 Nomor WhatsApp Terhubung',
       'Balas Otomatis Penuh Tanpa Batas Jam',
       '100 Pesan Otomatis / Hari',
-      'Batas Respon AI 25 / Hari (250/bln)',
+      'Respon AI Tanpa Batas Terpisah (Ikuti Batas Chat Harian)',
       '100% Tanpa Watermark (Pesan Murni)',
       'Akses Remote Bot Assistant WA',
       'Aturan Balas Otomatis Bebas Atur',
@@ -830,14 +830,38 @@ export function writeDbFile(data: LocalDatabase, immediate = false): void {
 // ==========================================
 // SUBSCRIPTION PLANS CRUD (SUPERADMIN EDITABLE)
 // ==========================================
+export function normalizeSubscriptionPlan(plan: SubscriptionPlan): SubscriptionPlan {
+  if (!plan || plan.id !== 'free') {
+    return { ...plan, max_sessions: 1 };
+  }
+  const dailyMsgLimit = Math.max(1, Number(plan.daily_msg_limit) || 100);
+  const monthlyMsgLimit = Math.max(dailyMsgLimit, Number(plan.monthly_msg_limit) || 500);
+  const updatedFeatures = Array.isArray(plan.features)
+    ? plan.features.map(f =>
+        /Batas\s+Respon\s+AI\s+25\s*\/\s*Hari/i.test(String(f))
+          ? 'Respon AI Tanpa Batas Terpisah (Ikuti Batas Chat Harian)'
+          : f
+      )
+    : [];
+  return {
+    ...plan,
+    max_sessions: 1,
+    daily_msg_limit: dailyMsgLimit,
+    monthly_msg_limit: monthlyMsgLimit,
+    daily_ai_limit: dailyMsgLimit,
+    monthly_ai_limit: monthlyMsgLimit,
+    features: updatedFeatures
+  };
+}
+
 export function getSubscriptionPlans(): SubscriptionPlan[] {
   const db = initDbFile();
-  return (db.plans || DEFAULT_SUBSCRIPTION_PLANS).map(p => ({ ...p, max_sessions: 1 }));
+  return (db.plans || DEFAULT_SUBSCRIPTION_PLANS).map(normalizeSubscriptionPlan);
 }
 
 export function saveSubscriptionPlans(plans: SubscriptionPlan[]): SubscriptionPlan[] {
   const db = initDbFile();
-  db.plans = plans.map(p => ({ ...p, max_sessions: 1 }));
+  db.plans = plans.map(normalizeSubscriptionPlan);
   writeDbFile(db, true);
   asyncSyncKv('plans', db.plans);
   return db.plans;
@@ -848,12 +872,12 @@ export function updateSubscriptionPlan(id: string, updates: Partial<Subscription
   const index = db.plans.findIndex(p => p.id === id);
   if (index === -1) return null;
 
-  db.plans[index] = {
+  db.plans[index] = normalizeSubscriptionPlan({
     ...db.plans[index],
     ...updates,
     max_sessions: 1,
     updated_at: new Date().toISOString()
-  };
+  });
   writeDbFile(db, true);
   asyncSyncKv('plans', db.plans);
   return db.plans[index];
@@ -1079,6 +1103,75 @@ export function generateUserApiKey(userId: string): string | null {
   return user.api_key;
 }
 
+function isUserOnFreeTier(user: UserAccount): boolean {
+  return user.role !== 'admin' && (!user.plan_id || user.plan_id === 'free' || user.plan_status !== 'active');
+}
+
+function resolveUserPlanForQuota(plans: SubscriptionPlan[], user: UserAccount): SubscriptionPlan {
+  const fallbackFree = plans.find(p => p.id === 'free') || plans[0] || DEFAULT_SUBSCRIPTION_PLANS[0];
+  if (isUserOnFreeTier(user)) {
+    return normalizeSubscriptionPlan(fallbackFree);
+  }
+  const matched = plans.find(p => p.id === user.plan_id) || fallbackFree;
+  return normalizeSubscriptionPlan(matched);
+}
+
+export function canUseDailyQuota(userId?: string): { allowed: boolean; remaining: number; dailyLimit: number; message?: string } {
+  if (!userId) return { allowed: true, remaining: 999999, dailyLimit: 999999 };
+  const db = initDbFile();
+  const targetUser = getUserById(userId);
+  if (!targetUser) return { allowed: false, remaining: 0, dailyLimit: 0, message: 'Pengguna tidak ditemukan' };
+  const user = db.users.find(u => u.id === targetUser.id);
+  if (!user) return { allowed: false, remaining: 0, dailyLimit: 0, message: 'Pengguna tidak ditemukan' };
+
+  const isAdmin = user.role === 'admin';
+  const plans = db.plans || DEFAULT_SUBSCRIPTION_PLANS;
+  const userPlan = resolveUserPlanForQuota(plans, user);
+  const dailyLimit = isAdmin ? 999999 : (userPlan.daily_msg_limit || 100);
+  const monthlyLimit = isAdmin ? 999999 : (userPlan.monthly_msg_limit || 500);
+
+  const today = new Date().toISOString().split('T')[0];
+  const currentMonth = today.substring(0, 7);
+  let mutated = false;
+  if (user.last_quota_reset_date !== today) {
+    user.daily_messages_sent = 0;
+    user.daily_ai_sent = 0;
+    user.last_quota_reset_date = today;
+    mutated = true;
+  }
+  if ((user as any).last_quota_reset_month !== currentMonth) {
+    user.monthly_messages_sent = 0;
+    user.monthly_ai_sent = 0;
+    (user as any).last_quota_reset_month = currentMonth;
+    mutated = true;
+  }
+  if (mutated) writeDbFile(db);
+
+  if (!isAdmin && (user.daily_messages_sent || 0) >= dailyLimit) {
+    return {
+      allowed: false,
+      remaining: 0,
+      dailyLimit,
+      message: `Kuota pesan harian Anda telah habis (${user.daily_messages_sent || 0}/${dailyLimit} pesan). Upgrade paket Anda untuk kuota lebih banyak.`
+    };
+  }
+
+  if (!isAdmin && (user.monthly_messages_sent || 0) >= monthlyLimit) {
+    return {
+      allowed: false,
+      remaining: 0,
+      dailyLimit,
+      message: `Kuota pesan bulanan Anda telah habis (${user.monthly_messages_sent || 0}/${monthlyLimit} pesan). Upgrade paket Anda untuk kuota lebih banyak.`
+    };
+  }
+
+  return {
+    allowed: true,
+    remaining: isAdmin ? 999999 : Math.max(0, dailyLimit - (user.daily_messages_sent || 0)),
+    dailyLimit: isAdmin ? 999999 : dailyLimit
+  };
+}
+
 export function deductUserDailyQuota(userId: string): { allowed: boolean; remaining: number; dailyLimit: number; message?: string } {
   const db = initDbFile();
   const targetUser = getUserById(userId);
@@ -1088,9 +1181,9 @@ export function deductUserDailyQuota(userId: string): { allowed: boolean; remain
 
   const isAdmin = user.role === 'admin';
   const plans = db.plans || DEFAULT_SUBSCRIPTION_PLANS;
-  const userPlan = plans.find(p => p.id === user.plan_id) || plans[0];
+  const userPlan = resolveUserPlanForQuota(plans, user);
   const dailyLimit = isAdmin ? 999999 : (userPlan.daily_msg_limit || 100);
-  const monthlyLimit = isAdmin ? 999999 : (userPlan.monthly_msg_limit || 3000);
+  const monthlyLimit = isAdmin ? 999999 : (userPlan.monthly_msg_limit || 500);
 
   const today = new Date().toISOString().split('T')[0];
   const currentMonth = today.substring(0, 7);
@@ -1177,10 +1270,14 @@ export function canUseAiQuota(userId?: string): {
   }
 
   const isAdmin = user.role === 'admin';
+  const isFree = isUserOnFreeTier(user);
   const plans = db.plans || DEFAULT_SUBSCRIPTION_PLANS;
-  const userPlan = plans.find(p => p.id === user.plan_id) || plans[0];
-  const dailyAiLimit = isAdmin ? 999999 : (userPlan.daily_ai_limit ?? 50);
-  const monthlyAiLimit = isAdmin ? 999999 : (userPlan.monthly_ai_limit ?? 1500);
+  const userPlan = resolveUserPlanForQuota(plans, user);
+  const dailyMsgLimit = isAdmin ? 999999 : (userPlan.daily_msg_limit || 100);
+  const monthlyMsgLimit = isAdmin ? 999999 : (userPlan.monthly_msg_limit || 500);
+  // Paket Gratis tidak memiliki batas AI terpisah — mengikuti batas chat harian/bulanan sepenuhnya
+  const dailyAiLimit = isAdmin ? 999999 : isFree ? dailyMsgLimit : (userPlan.daily_ai_limit ?? dailyMsgLimit);
+  const monthlyAiLimit = isAdmin ? 999999 : isFree ? monthlyMsgLimit : (userPlan.monthly_ai_limit ?? monthlyMsgLimit);
 
   const today = new Date().toISOString().split('T')[0];
   const currentMonth = today.substring(0, 7);
@@ -1199,10 +1296,34 @@ export function canUseAiQuota(userId?: string): {
   }
   if (mutated) writeDbFile(db);
 
+  const currentDailyMsg = user.daily_messages_sent || 0;
+  const currentMonthlyMsg = user.monthly_messages_sent || 0;
   const currentDailyAi = user.daily_ai_sent || 0;
   const currentMonthlyAi = user.monthly_ai_sent || 0;
 
-  if (!isAdmin && currentDailyAi >= dailyAiLimit) {
+  if (!isAdmin && currentDailyMsg >= dailyMsgLimit) {
+    return {
+      allowed: false,
+      remainingDaily: 0,
+      dailyLimit: dailyAiLimit,
+      remainingMonthly: Math.max(0, monthlyMsgLimit - currentMonthlyMsg),
+      monthlyLimit: monthlyAiLimit,
+      message: `Batas chat harian Anda telah habis (${currentDailyMsg}/${dailyMsgLimit}). Respon AI mengikuti batas chat harian.`
+    };
+  }
+
+  if (!isAdmin && currentMonthlyMsg >= monthlyMsgLimit) {
+    return {
+      allowed: false,
+      remainingDaily: Math.max(0, dailyMsgLimit - currentDailyMsg),
+      dailyLimit: dailyAiLimit,
+      remainingMonthly: 0,
+      monthlyLimit: monthlyAiLimit,
+      message: `Batas chat bulanan Anda telah habis (${currentMonthlyMsg}/${monthlyMsgLimit}). Respon AI mengikuti batas chat bulanan.`
+    };
+  }
+
+  if (!isAdmin && !isFree && currentDailyAi >= dailyAiLimit) {
     return {
       allowed: false,
       remainingDaily: 0,
@@ -1213,7 +1334,7 @@ export function canUseAiQuota(userId?: string): {
     };
   }
 
-  if (!isAdmin && currentMonthlyAi >= monthlyAiLimit) {
+  if (!isAdmin && !isFree && currentMonthlyAi >= monthlyAiLimit) {
     return {
       allowed: false,
       remainingDaily: Math.max(0, dailyAiLimit - currentDailyAi),
@@ -1226,10 +1347,18 @@ export function canUseAiQuota(userId?: string): {
 
   return {
     allowed: true,
-    remainingDaily: isAdmin ? 999999 : Math.max(0, dailyAiLimit - currentDailyAi),
-    dailyLimit: isAdmin ? 999999 : dailyAiLimit,
-    remainingMonthly: isAdmin ? 999999 : Math.max(0, monthlyAiLimit - currentMonthlyAi),
-    monthlyLimit: isAdmin ? 999999 : monthlyAiLimit
+    remainingDaily: isAdmin
+      ? 999999
+      : isFree
+        ? Math.max(0, dailyMsgLimit - currentDailyMsg)
+        : Math.max(0, dailyAiLimit - currentDailyAi),
+    dailyLimit: dailyAiLimit,
+    remainingMonthly: isAdmin
+      ? 999999
+      : isFree
+        ? Math.max(0, monthlyMsgLimit - currentMonthlyMsg)
+        : Math.max(0, monthlyAiLimit - currentMonthlyAi),
+    monthlyLimit: monthlyAiLimit
   };
 }
 
@@ -1266,10 +1395,13 @@ export function deductUserAiQuota(userId: string): {
   }
 
   const isAdmin = user.role === 'admin';
+  const isFree = isUserOnFreeTier(user);
   const plans = db.plans || DEFAULT_SUBSCRIPTION_PLANS;
-  const userPlan = plans.find(p => p.id === user.plan_id) || plans[0];
-  const dailyAiLimit = isAdmin ? 999999 : (userPlan.daily_ai_limit ?? 50);
-  const monthlyAiLimit = isAdmin ? 999999 : (userPlan.monthly_ai_limit ?? 1500);
+  const userPlan = resolveUserPlanForQuota(plans, user);
+  const dailyMsgLimit = isAdmin ? 999999 : (userPlan.daily_msg_limit || 100);
+  const monthlyMsgLimit = isAdmin ? 999999 : (userPlan.monthly_msg_limit || 500);
+  const dailyAiLimit = isAdmin ? 999999 : isFree ? dailyMsgLimit : (userPlan.daily_ai_limit ?? dailyMsgLimit);
+  const monthlyAiLimit = isAdmin ? 999999 : isFree ? monthlyMsgLimit : (userPlan.monthly_ai_limit ?? monthlyMsgLimit);
 
   const today = new Date().toISOString().split('T')[0];
   const currentMonth = today.substring(0, 7);
@@ -1287,7 +1419,7 @@ export function deductUserAiQuota(userId: string): {
   const currentDailyAi = user.daily_ai_sent || 0;
   const currentMonthlyAi = user.monthly_ai_sent || 0;
 
-  if (!isAdmin && currentDailyAi >= dailyAiLimit) {
+  if (!isAdmin && !isFree && currentDailyAi >= dailyAiLimit) {
     return {
       allowed: false,
       remainingDaily: 0,
@@ -1298,7 +1430,7 @@ export function deductUserAiQuota(userId: string): {
     };
   }
 
-  if (!isAdmin && currentMonthlyAi >= monthlyAiLimit) {
+  if (!isAdmin && !isFree && currentMonthlyAi >= monthlyAiLimit) {
     return {
       allowed: false,
       remainingDaily: Math.max(0, dailyAiLimit - currentDailyAi),
@@ -1315,10 +1447,18 @@ export function deductUserAiQuota(userId: string): {
 
   return {
     allowed: true,
-    remainingDaily: isAdmin ? 999999 : Math.max(0, dailyAiLimit - user.daily_ai_sent),
-    dailyLimit: isAdmin ? 999999 : dailyAiLimit,
-    remainingMonthly: isAdmin ? 999999 : Math.max(0, monthlyAiLimit - user.monthly_ai_sent),
-    monthlyLimit: isAdmin ? 999999 : monthlyAiLimit
+    remainingDaily: isAdmin
+      ? 999999
+      : isFree
+        ? Math.max(0, dailyMsgLimit - (user.daily_messages_sent || 0))
+        : Math.max(0, dailyAiLimit - user.daily_ai_sent),
+    dailyLimit: dailyAiLimit,
+    remainingMonthly: isAdmin
+      ? 999999
+      : isFree
+        ? Math.max(0, monthlyMsgLimit - (user.monthly_messages_sent || 0))
+        : Math.max(0, monthlyAiLimit - user.monthly_ai_sent),
+    monthlyLimit: monthlyAiLimit
   };
 }
 
@@ -2137,7 +2277,10 @@ export function getBotStats(userId?: string): BotStats {
   const primarySession = connectedUserSessions[0] || userSessions[0];
 
   const plans = db.plans || DEFAULT_SUBSCRIPTION_PLANS;
-  const userPlan = plans.find(p => p.id === user.plan_id) || plans[0];
+  const userPlan = resolveUserPlanForQuota(plans, user);
+  const isFree = isUserOnFreeTier(user);
+  const dailyMsgLimit = userPlan.daily_msg_limit || 100;
+  const monthlyMsgLimit = userPlan.monthly_msg_limit || 500;
 
   return {
     total_incoming: totalIncoming,
@@ -2152,13 +2295,13 @@ export function getBotStats(userId?: string): BotStats {
     primary_bot_phone: primarySession?.phone_number || user.phone,
     total_connected_sessions: connectedUserSessions.length,
     daily_messages_sent: user.daily_messages_sent || 0,
-    daily_msg_limit: userPlan.daily_msg_limit || 100,
+    daily_msg_limit: dailyMsgLimit,
     monthly_messages_sent: user.monthly_messages_sent || 0,
-    monthly_msg_limit: userPlan.monthly_msg_limit || 3000,
+    monthly_msg_limit: monthlyMsgLimit,
     daily_ai_sent: user.daily_ai_sent || 0,
-    daily_ai_limit: userPlan.daily_ai_limit || 50,
+    daily_ai_limit: isFree ? dailyMsgLimit : (userPlan.daily_ai_limit || dailyMsgLimit),
     monthly_ai_sent: user.monthly_ai_sent || 0,
-    monthly_ai_limit: userPlan.monthly_ai_limit || 1500,
+    monthly_ai_limit: isFree ? monthlyMsgLimit : (userPlan.monthly_ai_limit || monthlyMsgLimit),
     free_auto_reply_hours: 0,
     max_global_sessions: getMaxGlobalSessions(db.systemConfig),
     slot_status: getGlobalSlotStatus()

@@ -24,6 +24,7 @@ import {
   getSystemConfig,
   getUserById,
   canUseAiQuota,
+  canUseDailyQuota,
   deductUserAiQuota,
   deductUserDailyQuota,
   initDbFile,
@@ -268,6 +269,105 @@ function clearSessionCacheStores(sessionId: string) {
   sessionMsgRetryCaches.get(sessionId)?.flushAll();
   sessionMsgRetryCaches.delete(sessionId);
   sessionSignalKeyStores.delete(sessionId);
+}
+
+function persistCredsAtomicSync(sessionFolder: string, creds: any): void {
+  if (!sessionFolder || !creds) return;
+  fs.mkdirSync(sessionFolder, { recursive: true, mode: 0o700 });
+  const target = path.join(sessionFolder, 'creds.json');
+  const tmp = path.join(sessionFolder, `.creds.${process.pid}.${Date.now()}.tmp`);
+  const serialized = JSON.stringify(creds, (k, v) => {
+    if (v instanceof Uint8Array || Buffer.isBuffer(v)) {
+      return { type: 'Buffer', data: Array.from(v) };
+    }
+    if (v && typeof v === 'object' && v.type === 'Buffer' && Array.isArray(v.data)) {
+      return v;
+    }
+    return v;
+  });
+  fs.writeFileSync(tmp, serialized, { encoding: 'utf-8', mode: 0o600 });
+  fs.renameSync(tmp, target);
+}
+
+export async function createResilientMultiFileAuthState(sessionId: string, sessionFolder: string) {
+  fs.mkdirSync(sessionFolder, { recursive: true, mode: 0o700 });
+  const { state, saveCreds: rawSaveCreds } = await useMultiFileAuthState(sessionFolder);
+
+  const ensureFolderAndHydrate = async () => {
+    if (!fs.existsSync(sessionFolder)) {
+      fs.mkdirSync(sessionFolder, { recursive: true, mode: 0o700 });
+    }
+    const credsPath = path.join(sessionFolder, 'creds.json');
+    if (!fs.existsSync(credsPath)) {
+      await hydrateSessionAuthFolderFromMysql(sessionId).catch(() => false);
+      if (!fs.existsSync(credsPath) && state?.creds) {
+        try {
+          persistCredsAtomicSync(sessionFolder, state.creds);
+        } catch {
+          await rawSaveCreds();
+        }
+      }
+    }
+  };
+
+  const resilientRawKeys = {
+    async get(type: string, ids: string[]) {
+      try {
+        if (!fs.existsSync(sessionFolder)) {
+          await ensureFolderAndHydrate();
+        }
+        return await state.keys.get(type as any, ids);
+      } catch (err: any) {
+        if (err?.code === 'ENOENT') {
+          await ensureFolderAndHydrate();
+          return await state.keys.get(type as any, ids);
+        }
+        throw err;
+      }
+    },
+    async set(data: any) {
+      try {
+        if (!fs.existsSync(sessionFolder)) {
+          await ensureFolderAndHydrate();
+        }
+        await state.keys.set(data);
+      } catch (err: any) {
+        if (err?.code === 'ENOENT') {
+          await ensureFolderAndHydrate();
+          await state.keys.set(data);
+        } else {
+          throw err;
+        }
+      }
+    },
+    async clear() {
+      if (typeof (state.keys as any).clear === 'function') {
+        await (state.keys as any).clear();
+      }
+    }
+  };
+
+  const saveCreds = async () => {
+    try {
+      await ensureFolderAndHydrate();
+      await rawSaveCreds();
+    } catch (err: any) {
+      if (err?.code === 'ENOENT') {
+        await ensureFolderAndHydrate();
+        await rawSaveCreds();
+      } else {
+        throw err;
+      }
+    }
+  };
+
+  return {
+    state: {
+      creds: state.creds,
+      keys: resilientRawKeys
+    },
+    saveCreds
+  };
 }
 
 export function buildCachedAuthState(sessionId: string, state: any) {
@@ -997,19 +1097,37 @@ function isRecoverableProtocolCode(statusCode?: number): boolean {
 }
 
 function readCredsSummary(sessionId: string): { registered: boolean; phone: string } {
+  const mem = activeSessions.get(sessionId);
+  const memPhone = normalizePhoneNumber(
+    mem?.phoneNumber ||
+      (mem?.socket?.user?.id ? String(mem.socket.user.id).split('@')[0].split(':')[0] : '') ||
+      (mem?.socket?.authState?.creds?.me?.id ? String(mem.socket.authState.creds.me.id).split('@')[0].split(':')[0] : '') ||
+      ''
+  );
+  const memRegistered = Boolean(
+    mem &&
+      (mem.status === 'connected' ||
+        mem.socket?.authState?.creds?.registered ||
+        mem.socket?.user?.id)
+  );
+
   try {
     const folder = safeSessionFolderPath(sessionId);
-    if (!folder) return { registered: false, phone: '' };
+    if (!folder) return { registered: memRegistered, phone: memPhone };
     const credsPath = path.join(folder, 'creds.json');
-    if (!fs.existsSync(credsPath)) return { registered: false, phone: '' };
-    const parsed = JSON.parse(fs.readFileSync(credsPath, 'utf-8'));
+    if (!fs.existsSync(credsPath)) return { registered: memRegistered, phone: memPhone };
+    const raw = fs.readFileSync(credsPath, 'utf-8');
+    if (!raw || !raw.trim()) {
+      return { registered: memRegistered, phone: memPhone };
+    }
+    const parsed = JSON.parse(raw);
     const meId = parsed?.me?.id ? String(parsed.me.id) : '';
     return {
-      registered: Boolean(parsed && (parsed.registered || meId)),
-      phone: meId ? normalizePhoneNumber(meId.split('@')[0].split(':')[0]) : ''
+      registered: Boolean(parsed && (parsed.registered || meId)) || memRegistered,
+      phone: (meId ? normalizePhoneNumber(meId.split('@')[0].split(':')[0]) : '') || memPhone
     };
   } catch {
-    return { registered: false, phone: '' };
+    return { registered: memRegistered, phone: memPhone };
   }
 }
 
@@ -2047,6 +2165,36 @@ export function attachSocketMessageListener(sock: any, sessionId: string, sessio
       return;
     }
 
+    if (sessionUser) {
+      const dailyGate = canUseDailyQuota(sessionUser.id);
+      if (!dailyGate.allowed) {
+        const quotaMsg = dailyGate.message || 'Kuota chat harian/bulanan Anda telah habis.';
+        recordAiAuditEvent({
+          level: 'WARN',
+          stage: 'quota_gate',
+          session_id: sessionId,
+          user_id: sessionUser.id,
+          senderPhone,
+          error_code: 'DAILY_CHAT_QUOTA_EXCEEDED',
+          reason: quotaMsg
+        });
+        addMessageLog({
+          wam_id: msg.key.id || `baileys_in_${Date.now()}`,
+          user_id: sessionUser.id,
+          session_id: sessionId,
+          sender_phone: senderPhone,
+          sender_name: senderName,
+          message_body: messageText,
+          direction: 'incoming',
+          status: 'Diterima',
+          reply_body: quotaMsg,
+          error_detail: `[Batas Chat Harian Habis] ${quotaMsg}`,
+          ai_generated: false
+        });
+        return;
+      }
+    }
+
     const antiBan = getAntiBanSettings();
 
     let replyText = '';
@@ -2234,80 +2382,85 @@ export function attachSocketMessageListener(sock: any, sessionId: string, sessio
         }
       }
 
-      // Anti-Ban Simulation & Length-Scaled Random Typing Delay (kept responsive so total reply latency stays fast)
-      if (antiBan.enabled) {
-        const minS = Math.max(1, Math.min(3, antiBan.min_delay_seconds || 1));
-        const maxS = Math.max(minS, Math.min(5, antiBan.max_delay_seconds || 3));
-        const baseMs = minS * 1000;
-        const spanMs = Math.max(300, (maxS - minS) * 1000);
-        const lengthFactor = Math.min(1, replyText.length / 180);
-        const jitterMs = crypto.randomInt(0, Math.max(200, Math.floor(spanMs * 0.4)));
-        const randomDelayMs = Math.min(maxS * 1000, Math.round(baseMs + spanMs * 0.5 * lengthFactor + jitterMs));
+      try {
+        if (antiBan.enabled) {
+          const minS = Math.max(1, Math.min(3, antiBan.min_delay_seconds || 1));
+          const maxS = Math.max(minS, Math.min(5, antiBan.max_delay_seconds || 3));
+          const baseMs = minS * 1000;
+          const spanMs = Math.max(300, (maxS - minS) * 1000);
+          const lengthFactor = Math.min(1, replyText.length / 180);
+          const jitterMs = crypto.randomInt(0, Math.max(200, Math.floor(spanMs * 0.4)));
+          const randomDelayMs = Math.min(maxS * 1000, Math.round(baseMs + spanMs * 0.5 * lengthFactor + jitterMs));
 
-        console.log(`[Baileys Anti-Ban] Typing simulation & random delay (${(randomDelayMs / 1000).toFixed(1)}s) for ${senderPhone}...`);
+          console.log(`[Baileys Anti-Ban] Typing simulation & random delay (${(randomDelayMs / 1000).toFixed(1)}s) for ${senderPhone}...`);
 
-        if (antiBan.typing_simulation && typeof sock?.sendPresenceUpdate === 'function') {
-          void Promise.race([Promise.resolve().then(() => sock.sendPresenceUpdate('composing', replyTargetJid)), delay(1200)]).catch(() => {});
+          if (antiBan.typing_simulation && typeof sock?.sendPresenceUpdate === 'function') {
+            void Promise.race([Promise.resolve().then(() => sock.sendPresenceUpdate('composing', replyTargetJid)), delay(1200)]).catch(() => {});
+          }
+
+          await delay(randomDelayMs);
+
+          if (antiBan.typing_simulation && typeof sock?.sendPresenceUpdate === 'function') {
+            void Promise.race([Promise.resolve().then(() => sock.sendPresenceUpdate('paused', replyTargetJid)), delay(800)]).catch(() => {});
+          }
         }
 
-        await delay(randomDelayMs);
-
-        if (antiBan.typing_simulation && typeof sock?.sendPresenceUpdate === 'function') {
-          void Promise.race([Promise.resolve().then(() => sock.sendPresenceUpdate('paused', replyTargetJid)), delay(800)]).catch(() => {});
+        recordBotOutgoing(replyText);
+        let sentQrisSuccessfully = false;
+        if (sendQrisImage && (qrisImageUrl || qrisPublicUrl)) {
+          const localQrisBuf = resolveLocalCatalogImageBuffer(qrisImageUrl || qrisPublicUrl);
+          const imageSource: any = localQrisBuf
+            ? localQrisBuf
+            : (qrisPublicUrl && /^https?:\/\//i.test(qrisPublicUrl) ? { url: qrisPublicUrl } : null);
+          if (imageSource) {
+            try {
+              await sendSocketMessageWithAckGuard(
+                sock,
+                replyTargetJid,
+                {
+                  image: imageSource,
+                  caption: replyText
+                },
+                { timeoutMs: 30000, fallbackJid: fallbackPnJid, sessionData }
+              );
+              sentQrisSuccessfully = true;
+              sendSucceeded = true;
+              console.log(`[Baileys System QRIS Sent] To ${senderPhone} (${qrisImageUrl})`);
+            } catch (qrisErr) {
+              console.warn('[Baileys QRIS Send Fallback to Text]', qrisErr);
+            }
+          }
         }
-      }
 
-      recordBotOutgoing(replyText);
-      let sentQrisSuccessfully = false;
-      if (sendQrisImage && (qrisImageUrl || qrisPublicUrl)) {
-        const localQrisBuf = resolveLocalCatalogImageBuffer(qrisImageUrl || qrisPublicUrl);
-        const imageSource: any = localQrisBuf
-          ? localQrisBuf
-          : (qrisPublicUrl && /^https?:\/\//i.test(qrisPublicUrl) ? { url: qrisPublicUrl } : null);
-        if (imageSource) {
+        if (!sentQrisSuccessfully) {
           try {
             await sendSocketMessageWithAckGuard(
               sock,
               replyTargetJid,
-              {
-                image: imageSource,
-                caption: replyText
-              },
-              { timeoutMs: 30000, fallbackJid: fallbackPnJid, sessionData }
+              { text: replyText },
+              { timeoutMs: 22000, fallbackJid: fallbackPnJid, sessionData }
             );
-            sentQrisSuccessfully = true;
             sendSucceeded = true;
-            console.log(`[Baileys System QRIS Sent] To ${senderPhone} (${qrisImageUrl})`);
-          } catch (qrisErr) {
-            console.warn('[Baileys QRIS Send Fallback to Text]', qrisErr);
+            console.log(`[Baileys Auto-Reply Sent ${isAi ? '(AI)' : ''}] To ${senderPhone}: "${replyText}"`);
+          } catch (replySendErr: any) {
+            const replyErrText = String(replySendErr?.message || 'Gagal mengirim balasan otomatis ke WhatsApp');
+            sendErrorDetail = replyErrText;
+            recordAiAuditEvent({
+              level: 'ERROR',
+              stage: 'reply_send',
+              session_id: sessionId,
+              user_id: resolvedOwnerId,
+              customer_code: currentOrderFlow?.context.customerCode,
+              senderPhone,
+              error_code: 'REPLY_SEND_FAILED',
+              reason: replyErrText
+            });
+            console.error(`[Baileys Auto-Reply Send Error] To ${senderPhone}:`, sendErrorDetail);
           }
         }
-      }
-
-      if (!sentQrisSuccessfully) {
-        try {
-          await sendSocketMessageWithAckGuard(
-            sock,
-            replyTargetJid,
-            { text: replyText },
-            { timeoutMs: 22000, fallbackJid: fallbackPnJid, sessionData }
-          );
-          sendSucceeded = true;
-          console.log(`[Baileys Auto-Reply Sent ${isAi ? '(AI)' : ''}] To ${senderPhone}: "${replyText}"`);
-        } catch (replySendErr: any) {
-          const replyErrText = String(replySendErr?.message || 'Gagal mengirim balasan otomatis ke WhatsApp');
-          sendErrorDetail = replyErrText;
-          recordAiAuditEvent({
-            level: 'ERROR',
-            stage: 'reply_send',
-            session_id: sessionId,
-            user_id: resolvedOwnerId,
-            customer_code: currentOrderFlow?.context.customerCode,
-            senderPhone,
-            error_code: 'REPLY_SEND_FAILED',
-            reason: replyErrText
-          });
-          console.error(`[Baileys Auto-Reply Send Error] To ${senderPhone}:`, sendErrorDetail);
+      } finally {
+        if (!sendSucceeded && antiBan.enabled && antiBan.typing_simulation && typeof sock?.sendPresenceUpdate === 'function') {
+          void Promise.race([Promise.resolve().then(() => sock.sendPresenceUpdate('paused', replyTargetJid)), delay(600)]).catch(() => {});
         }
       }
 
@@ -2530,7 +2683,7 @@ export async function getOrStartBaileysSession(
         scheduleAuthFolderBackup(sessionId);
       }
 
-      const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
+      const { state, saveCreds } = await createResilientMultiFileAuthState(sessionId, sessionFolder);
       const cachedAuthState = buildCachedAuthState(sessionId, state);
       const cacheStores = getSessionCacheStores(sessionId);
       const version = await resolveBaileysVersion();
@@ -2633,17 +2786,18 @@ export async function getOrStartBaileysSession(
                 s.phone_number &&
                 normalizePhoneNumber(s.phone_number) === connectedUser
             );
-          const expiryDate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+          const expiryDate = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString();
           const openNowIso = new Date().toISOString();
           if (existingDb) {
+            const existingExpiryMs = existingDb.expires_at ? Date.parse(existingDb.expires_at) : 0;
             updateSession(existingDb.id, {
               id: sessionId,
               status: 'connected',
               phone_number: connectedUser,
               user_id: owner!.id,
               connected_at: existingDb.connected_at || openNowIso,
-              last_activity_at: existingDb.last_activity_at || existingDb.connected_at || openNowIso,
-              expires_at: existingDb.expires_at || expiryDate
+              last_activity_at: openNowIso,
+              expires_at: existingExpiryMs > Date.now() + 30 * 24 * 60 * 60 * 1000 ? existingDb.expires_at : expiryDate
             });
           } else {
               addSession({
@@ -2861,7 +3015,7 @@ export async function requestBaileysPairingCode(
   }
   fs.mkdirSync(sessionFolder, { recursive: true, mode: 0o700 });
 
-  const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
+  const { state, saveCreds } = await createResilientMultiFileAuthState(sessionId, sessionFolder);
   const cachedAuthState = buildCachedAuthState(sessionId, state);
   const cacheStores = getSessionCacheStores(sessionId);
   const version = await resolveBaileysVersion();
@@ -2944,17 +3098,18 @@ export async function requestBaileysPairingCode(
             s.phone_number &&
             normalizePhoneNumber(s.phone_number) === connectedUser
         );
-      const expiryDate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+      const expiryDate = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString();
       const pairOpenIso = new Date().toISOString();
       if (existingDb) {
+        const existingExpiryMs = existingDb.expires_at ? Date.parse(existingDb.expires_at) : 0;
         updateSession(existingDb.id, {
           id: sessionId,
           status: 'connected',
           phone_number: connectedUser,
           user_id: owner!.id,
           connected_at: existingDb.connected_at || pairOpenIso,
-          last_activity_at: existingDb.last_activity_at || existingDb.connected_at || pairOpenIso,
-          expires_at: existingDb.expires_at || expiryDate
+          last_activity_at: pairOpenIso,
+          expires_at: existingExpiryMs > Date.now() + 30 * 24 * 60 * 60 * 1000 ? existingDb.expires_at : expiryDate
         });
       } else {
           addSession({
@@ -3511,6 +3666,18 @@ export async function pruneInactiveAndUnregisteredBaileysSessions(force = false)
 
     const doPurge = async (sid: string, phone?: string, reason?: string) => {
       if (!sid || purgedIds.has(sid)) return;
+      // Never delete a folder/session while an active socket in memory is connected, connecting, or reconnecting!
+      const liveMem = activeSessions.get(sid);
+      if (
+        sessionStartLocks.has(sid) ||
+        reconnectTimers.has(sid) ||
+        (liveMem &&
+          (liveMem.status === 'connected' ||
+            isSocketTrulyOpen(liveMem.socket) ||
+            (liveMem.status === 'connecting' && Date.now() - liveMem.handshakeStartedAt <= UNSCANNED_HANDSHAKE_TTL_MS)))
+      ) {
+        return;
+      }
       purgedIds.add(sid);
       purgedCount++;
       console.log(`[Baileys Auto-Purge] Menghapus sesi "${sid}" (${reason || 'inactive/unregistered'}).`);
@@ -3529,25 +3696,35 @@ export async function pruneInactiveAndUnregisteredBaileysSessions(force = false)
       continue;
     }
 
+    // Keep active/Meta-AI-enabled sessions alive without auto-expiring them
+    const sessionHasPersistentAi = Boolean(owner && (owner.role === 'admin' || owner.ai_enabled || owner.meta_ai_verified));
     if (s.expires_at && new Date(s.expires_at).getTime() < now) {
-      if (s.phone_number) {
-        await notifyUserSessionExpired({
-          sessionId: s.id,
-          sessionName: s.session_name,
-          expiredPhone: s.phone_number,
-          userId: s.user_id,
-          reason: 'masa aktif sesi login telah habis (expired)'
-        }).catch(() => {});
+      if (hasOpenSocket || sessionHasPersistentAi) {
+        updateSession(s.id, {
+          expires_at: new Date(now + 365 * 24 * 60 * 60 * 1000).toISOString()
+        });
+      } else {
+        if (s.phone_number) {
+          await notifyUserSessionExpired({
+            sessionId: s.id,
+            sessionName: s.session_name,
+            expiredPhone: s.phone_number,
+            userId: s.user_id,
+            reason: 'masa aktif sesi login telah habis (expired)'
+          }).catch(() => {});
+        }
+        await doPurge(s.id, s.phone_number, 'masa aktif sesi berakhir');
+        continue;
       }
-      await doPurge(s.id, s.phone_number, 'masa aktif sesi berakhir');
-      continue;
     }
 
-    // Hapus otomatis sesi Perangkat Tertaut apabila tidak ada aktivitas pesan masuk maupun balasan selama 3 hari (72 jam)
+    // Hapus otomatis sesi Perangkat Tertaut hanya jika tidak ada aktivitas > 3 hari DAN tidak dipakai AI/Admin aktif
     const lastActivityIso = s.last_activity_at || s.connected_at || s.updated_at || s.created_at;
     const lastActivityMs = lastActivityIso ? Date.parse(lastActivityIso) : NaN;
     const isLinkedSession = s.status === 'connected' || Boolean(s.connected_at) || hasRegisteredCredsOnDisk(s.id);
     if (
+      !hasOpenSocket &&
+      !sessionHasPersistentAi &&
       isLinkedSession &&
       Number.isFinite(lastActivityMs) &&
       now - lastActivityMs >= SESSION_INACTIVITY_PURGE_MS
@@ -3597,16 +3774,11 @@ export async function pruneInactiveAndUnregisteredBaileysSessions(force = false)
     if (purgedIds.has(sid)) continue;
     const summary = readCredsSummary(sid);
     const dbSess = getSessionById(sid);
-    const memRegistered = Boolean(mem.socket?.authState?.creds?.registered || mem.socket?.user?.id);
+    const memRegistered = Boolean(mem.socket?.authState?.creds?.registered || mem.socket?.user?.id || mem.status === 'connected');
     const owner = resolveActiveVerifiedOwner(sid, mem.userId, mem.phoneNumber || summary.phone);
 
     if (!isOwnerActiveAndRegistered(owner)) {
       await doPurge(sid, mem.phoneNumber || summary.phone, 'socket memori tidak memiliki pemilik terdaftar aktif');
-      continue;
-    }
-
-    if (dbSess?.expires_at && new Date(dbSess.expires_at).getTime() < now) {
-      await doPurge(sid, mem.phoneNumber || summary.phone, 'masa aktif sesi di memori berakhir');
       continue;
     }
 
@@ -3642,9 +3814,9 @@ export async function pruneInactiveAndUnregisteredBaileysSessions(force = false)
         const mem = activeSessions.get(entry);
         const dbSess = getSessionById(entry);
         const { registered: isRegistered, phone: credsPhone } = readCredsSummary(entry);
-        const memRegistered = Boolean(mem?.socket?.authState?.creds?.registered || mem?.socket?.user?.id);
+        const memRegistered = Boolean(mem && (mem.status === 'connected' || mem.socket?.authState?.creds?.registered || mem.socket?.user?.id));
 
-        if (!isRegistered && !memRegistered) {
+        if (!isRegistered && !memRegistered && !dbSess?.connected_at) {
           const isFreshConnecting = mem && mem.status === 'connecting' && now - mem.handshakeStartedAt <= UNSCANNED_HANDSHAKE_TTL_MS;
           if (!isFreshConnecting && now - stat.mtimeMs > UNSCANNED_HANDSHAKE_TTL_MS) {
             await doPurge(entry, credsPhone, 'folder auth tidak terdaftar & kadaluarsa');
@@ -3658,11 +3830,6 @@ export async function pruneInactiveAndUnregisteredBaileysSessions(force = false)
           continue;
         }
 
-        if (dbSess?.expires_at && new Date(dbSess.expires_at).getTime() < now) {
-          await doPurge(entry, credsPhone, 'folder auth sudah melewati tanggal kedaluwarsa');
-          continue;
-        }
-
         // Recover DB session entry when disk creds remain valid after build/restart
         if (!dbSess && owner) {
           addSession({
@@ -3672,7 +3839,8 @@ export async function pruneInactiveAndUnregisteredBaileysSessions(force = false)
             auth_method: 'qr_code',
             status: 'connected',
             user_id: owner.id,
-            is_primary: true
+            is_primary: true,
+            expires_at: new Date(now + 365 * 24 * 60 * 60 * 1000).toISOString()
           });
         }
       } catch {
@@ -3687,12 +3855,13 @@ export async function pruneInactiveAndUnregisteredBaileysSessions(force = false)
         const mysqlAuthIds = await loadAllBaileysAuthSessionIdsFromMysql().catch(() => []);
         for (const sid of mysqlAuthIds) {
           if (purgedIds.has(sid)) continue;
+          const mem = activeSessions.get(sid);
+          if (mem && (mem.status === 'connected' || isSocketTrulyOpen(mem.socket))) continue;
           const dbSess = getSessionById(sid);
           const owner = resolveActiveVerifiedOwner(sid, dbSess?.user_id, dbSess?.phone_number);
-          const isExpired = Boolean(dbSess?.expires_at && new Date(dbSess.expires_at).getTime() < now);
           const hasDiskCreds = hasRegisteredCredsOnDisk(sid);
-          if (!isOwnerActiveAndRegistered(owner) || isExpired || (!dbSess && !hasDiskCreds)) {
-            await doPurge(sid, dbSess?.phone_number, 'backup auth MySQL tidak memiliki pemilik/sesi aktif atau sudah expired');
+          if (!isOwnerActiveAndRegistered(owner) || (!dbSess && !hasDiskCreds)) {
+            await doPurge(sid, dbSess?.phone_number, 'backup auth MySQL tidak memiliki pemilik/sesi aktif');
           }
         }
       }

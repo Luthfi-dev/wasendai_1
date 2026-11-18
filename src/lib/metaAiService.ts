@@ -143,27 +143,27 @@ const sessionLastMetaError = new Map<string, { code: string; message: string; at
 const wrappedSockets = new WeakMap<object, { active: boolean; sessionId: string; socket: any }>();
 
 const MAX_QUEUE_DEPTH = 35;
-const HARD_TIMEOUT_MS = 30000;
-const SILENT_FALLBACK_RETRY_MS = 8500;
+const HARD_TIMEOUT_MS = 32000;
+const SILENT_FALLBACK_RETRY_MS = 5500;
 const SETTLE_DEBOUNCE_MS = 1400;
 const PROMPT_ECHO_TTL_MS = 90000;
-const BOT_SECRET_TTL_MS = 90 * 1000;
+const BOT_SECRET_TTL_MS = 180 * 1000;
 const MAX_BOT_SECRETS = 120;
 const MAX_RECENT_PROMPTS = 200;
 const MAX_TRACKED_SESSIONS = 200;
 const MAX_RESPONSE_CACHE = 200;
 const RESPONSE_CACHE_TTL_MS = 10 * 60 * 1000;
 const MAX_SENDER_HISTORY = 500;
-const SENDER_BURST_WINDOW_MS = 2 * 60 * 1000;
-const SENDER_BURST_MAX = 8;
-const MIN_INTER_QUERY_MS = 2000;
-const INTER_QUERY_JITTER_MS = 1200;
-const MAX_PROMPTS_PER_MIN = 12;
-const MAX_PROMPTS_PER_HOUR = 140;
-const BOT_LIST_CACHE_TTL_MS = 10 * 60 * 1000;
+const SENDER_BURST_WINDOW_MS = 60 * 1000;
+const SENDER_BURST_MAX = 25;
+const MIN_INTER_QUERY_MS = 1600;
+const INTER_QUERY_JITTER_MS = 900;
+const MAX_PROMPTS_PER_MIN = 25;
+const MAX_PROMPTS_PER_HOUR = 600;
+const BOT_LIST_CACHE_TTL_MS = 30 * 60 * 1000;
 const BOT_LIST_EMPTY_CACHE_TTL_MS = 5 * 60 * 1000;
-const BOT_SIGNAL_READY_TTL_MS = 4 * 60 * 1000;
-const BOT_JID_REJECT_TTL_MS = 30 * 60 * 1000;
+const BOT_SIGNAL_READY_TTL_MS = 60 * 60 * 1000;
+const BOT_JID_REJECT_TTL_MS = 60 * 1000;
 
 const metaAiMaintenanceTimer = setInterval(() => {
   const now = Date.now();
@@ -1004,7 +1004,8 @@ export async function handleRawMetaAiMessageNode(
     const waiter = activeWaiters.get(sessionId);
     if (waiter && !waiter.settled && unavailableType === 'bot_unavailable_fanout') {
       waiter.lastAckError = errMsg;
-      setSessionMetaCooldown(sessionId, 180_000, waiter.lastAckError);
+      sessionPreferredMetaJid.delete(sessionId);
+      setSessionMetaCooldown(sessionId, 10_000, waiter.lastAckError);
     }
     return true;
   }
@@ -1055,8 +1056,33 @@ export function handleMetaAiMessageAckNode(sessionId: string, ackNode: any) {
   });
 
   if (ackErr === '463' || ackErr === '429') {
-    console.log(`[Meta AI Routing] Session=${sessionId} msgId=${ackId} ack_code=${ackErr}; mengaktifkan jeda otomatis & fallback CS.`);
-    setSessionMetaCooldown(sessionId, 180_000, errDesc);
+    console.log(`[Meta AI Routing] Session=${sessionId} msgId=${ackId} ack_code=${ackErr}; membersihkan cache jalur & beralih.`);
+    sessionPreferredMetaJid.delete(sessionId);
+    for (const cacheKey of Array.from(botSignalReadyCache.keys())) {
+      if (cacheKey.startsWith(`${sessionId}::`)) {
+        botSignalReadyCache.delete(cacheKey);
+      }
+    }
+    if (ackErr === '429') {
+      setSessionMetaCooldown(sessionId, 15_000, errDesc);
+    }
+    if (waiter.fallbackAttemptFn) {
+      const runFallback = waiter.fallbackAttemptFn;
+      void runFallback()
+        .then((attempted) => {
+          const current = activeWaiters.get(sessionId);
+          if (!attempted && current && !current.settled && !current.hasSignal && !current.latestText) {
+            finalizeWaiter(sessionId, { ok: false, reason: errDesc });
+          }
+        })
+        .catch(() => {
+          const current = activeWaiters.get(sessionId);
+          if (current && !current.settled && !current.hasSignal && !current.latestText) {
+            finalizeWaiter(sessionId, { ok: false, reason: errDesc });
+          }
+        });
+      return;
+    }
     finalizeWaiter(sessionId, { ok: false, reason: errDesc });
     return;
   }
@@ -1085,9 +1111,6 @@ export function handleMetaAiMessageAckNode(sessionId: string, ackNode: any) {
       .then((attempted) => {
         const current = activeWaiters.get(sessionId);
         if (!attempted && current && !current.settled && !current.hasSignal && !current.latestText) {
-          if (ackErr === '488' || ackErr === '479') {
-            setSessionMetaCooldown(sessionId, 180_000, errDesc);
-          }
           finalizeWaiter(sessionId, { ok: false, reason: errDesc });
         }
       })
@@ -1101,9 +1124,6 @@ export function handleMetaAiMessageAckNode(sessionId: string, ackNode: any) {
   }
 
   console.log(`[Meta AI Routing] Session=${sessionId} msgId=${ackId} ack_code=${ackErr}; beralih ke balasan fallback.`);
-  if (ackErr === '488' || ackErr === '479') {
-    setSessionMetaCooldown(sessionId, 180_000, errDesc);
-  }
   finalizeWaiter(sessionId, { ok: false, reason: errDesc });
 }
 
@@ -1921,6 +1941,21 @@ async function ensureBotSignalSessionAndDevice(sessionId: string, socket: any, t
     }
   }
 
+  if (!hasSession && typeof socket?.assertSessions === 'function') {
+    try {
+      await Promise.race([
+        socket.assertSessions([targetJid], true),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 5000))
+      ]);
+      if (repo?.validateSession) {
+        const recheckAssert = await repo.validateSession(targetJid);
+        hasSession = Boolean(recheckAssert?.exists);
+      }
+    } catch {
+      // Fall through to raw encrypt prekey IQ probe
+    }
+  }
+
   if (!hasSession && typeof socket?.query === 'function' && repo) {
     try {
       const res = await Promise.race([
@@ -1960,6 +1995,8 @@ async function ensureBotSignalSessionAndDevice(sessionId: string, socket: any, t
   if (hasSession) {
     botSignalReadyCache.set(cacheKey, Date.now() + BOT_SIGNAL_READY_TTL_MS);
     capMapSize(botSignalReadyCache, MAX_TRACKED_SESSIONS * 2);
+  } else {
+    botSignalReadyCache.delete(cacheKey);
   }
 
   return hasSession;
@@ -2033,7 +2070,9 @@ export async function resolveMetaAiCandidateJids(sessionId: string, socket: any)
 
   const dedupedValid = Array.from(new Set(ordered.filter((j) => isRoutableOutgoingMetaJid(j))));
   const nonRejected = dedupedValid.filter((j) => !isSessionBotJidRejected(sessionId, j));
-  return nonRejected.length > 0 ? nonRejected : dedupedValid;
+  if (nonRejected.length === 0) return dedupedValid;
+  const nonRejectedSet = new Set(nonRejected);
+  return [...nonRejected, ...dedupedValid.filter((j) => !nonRejectedSet.has(j))];
 }
 
 async function simulateHumanMetaTyping(socket: any, targetJid: string, _promptText: string): Promise<void> {
@@ -2370,6 +2409,10 @@ async function sendPromptToMetaAi(
     const targetJid = candidates[i];
     try {
       const usedJid = await sendPromptToSingleJid(sessionId, socket, targetJid, promptText, waiter);
+      if (usedJid) {
+        sessionPreferredMetaJid.set(sessionId, usedJid);
+        capMapSize(sessionPreferredMetaJid, MAX_TRACKED_SESSIONS);
+      }
       return {
         usedJid,
         remainingCandidates: candidates.slice(i + 1)
@@ -2673,7 +2716,10 @@ export async function askMetaAiViaBaileys(
     };
   }
 
-  const entry = socketProvider(params.userId, params.sessionId);
+  let entry = socketProvider(params.userId, params.sessionId);
+  if (!entry || !isSocketOpen(entry.socket)) {
+    entry = await ensureConnectedMetaAiSocketForUser(params.userId, params.sessionId);
+  }
   if (!entry || !isSocketOpen(entry.socket)) {
     const err = 'Belum ada perangkat WhatsApp Baileys yang terhubung untuk akun ini.';
     recordAiAuditEvent({
@@ -2828,20 +2874,12 @@ export async function askMetaAiViaBaileys(
           if (current && !current.settled && current.latestText) {
             finalizeWaiter(liveEntry.sessionId, { ok: true, text: current.latestText });
           } else {
-            const prevCd = sessionCooldowns.get(liveEntry.sessionId);
-            const timeouts = (prevCd?.consecutiveTimeouts || 0) + 1;
-            if (timeouts >= 3) {
-              sessionCooldowns.set(liveEntry.sessionId, {
-                until: Date.now() + 45_000,
-                consecutiveTimeouts: timeouts,
-                reason: 'Meta AI tidak merespons beberapa kali berturut-turut; jeda otomatis 45 detik diterapkan.'
-              });
-            } else {
-              sessionCooldowns.set(liveEntry.sessionId, {
-                until: prevCd?.until || 0,
-                consecutiveTimeouts: timeouts,
-                reason: current?.lastAckError || 'Meta AI timeout.'
-              });
+            // Reset stale Signal/JID caches so next message retries fresh immediately without multi-minute freeze
+            sessionPreferredMetaJid.delete(liveEntry.sessionId);
+            for (const key of Array.from(botSignalReadyCache.keys())) {
+              if (key.startsWith(`${liveEntry.sessionId}::`)) {
+                botSignalReadyCache.delete(key);
+              }
             }
             finalizeWaiter(liveEntry.sessionId, {
               ok: false,

@@ -742,11 +742,19 @@ export const SuperadminMasterPanel: React.FC<SuperadminMasterPanelProps> = ({
                     </div>
                     <div className="font-bold text-indigo-600 dark:text-indigo-400 flex items-center justify-between">
                       <span>🤖 Respon AI:</span>
-                      <span>{(plan.daily_ai_limit ?? 50).toLocaleString('id-ID')} / hari</span>
+                      <span>
+                        {plan.id === 'free'
+                          ? `${plan.daily_msg_limit.toLocaleString('id-ID')} / hari (Ikuti Limit WA)`
+                          : `${(plan.daily_ai_limit ?? 50).toLocaleString('id-ID')} / hari`}
+                      </span>
                     </div>
                     <div className="text-slate-500 text-[11px] flex items-center justify-between">
                       <span>📅 Limit AI / Bln:</span>
-                      <span>{(plan.monthly_ai_limit ?? 1500).toLocaleString('id-ID')} / bln</span>
+                      <span>
+                        {plan.id === 'free'
+                          ? `${(plan.monthly_msg_limit ?? 500).toLocaleString('id-ID')} / bln`
+                          : `${(plan.monthly_ai_limit ?? 1500).toLocaleString('id-ID')} / bln`}
+                      </span>
                     </div>
                     <div className="text-slate-500 text-[11px] flex items-center justify-between border-t border-slate-200/50 dark:border-slate-800 pt-1">
                       <span>📱 WhatsApp:</span>
@@ -1885,31 +1893,41 @@ export const SuperadminMasterPanel: React.FC<SuperadminMasterPanelProps> = ({
               <div className="p-3 bg-indigo-50/50 dark:bg-indigo-950/20 border border-indigo-200/60 dark:border-indigo-800/60 rounded-2xl space-y-2">
                 <div className="flex items-center space-x-1.5 text-xs font-black text-indigo-700 dark:text-indigo-300">
                   <Sparkles className="w-3.5 h-3.5" />
-                  <span>Batas Kuota Respon Meta AI WhatsApp (Otomatis)</span>
+                  <span>
+                    {editingPlan.id === 'free'
+                      ? 'Respon Meta AI Paket Gratis (Otomatis Mengikuti Batas Chat Harian)'
+                      : 'Batas Kuota Respon Meta AI WhatsApp (Otomatis)'}
+                  </span>
                 </div>
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="text-[11px] font-bold text-slate-700 dark:text-slate-300 block mb-1">Batas Respon AI / Hari</label>
-                    <input
-                      type="number"
-                      required
-                      value={editingPlan.daily_ai_limit ?? 50}
-                      onChange={e => setEditingPlan({ ...editingPlan, daily_ai_limit: Number(e.target.value) })}
-                      className="w-full bg-white dark:bg-slate-900 border border-indigo-200 dark:border-indigo-800 rounded-xl p-2.5 text-xs font-bold text-indigo-600 dark:text-indigo-400"
-                    />
-                  </div>
+                {editingPlan.id === 'free' ? (
+                  <p className="text-[11px] text-indigo-700/90 dark:text-indigo-300/90">
+                    Akun Paket Gratis tidak dibatasi kuota AI terpisah — batas respon AI otomatis mengikuti limit pesan harian ({editingPlan.daily_msg_limit}/hari) dan bulanan ({editingPlan.monthly_msg_limit}/bln).
+                  </p>
+                ) : (
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="text-[11px] font-bold text-slate-700 dark:text-slate-300 block mb-1">Batas Respon AI / Hari</label>
+                      <input
+                        type="number"
+                        required
+                        value={editingPlan.daily_ai_limit ?? 50}
+                        onChange={e => setEditingPlan({ ...editingPlan, daily_ai_limit: Number(e.target.value) })}
+                        className="w-full bg-white dark:bg-slate-900 border border-indigo-200 dark:border-indigo-800 rounded-xl p-2.5 text-xs font-bold text-indigo-600 dark:text-indigo-400"
+                      />
+                    </div>
 
-                  <div>
-                    <label className="text-[11px] font-bold text-slate-700 dark:text-slate-300 block mb-1">Batas Respon AI / Bulan</label>
-                    <input
-                      type="number"
-                      required
-                      value={editingPlan.monthly_ai_limit ?? 1500}
-                      onChange={e => setEditingPlan({ ...editingPlan, monthly_ai_limit: Number(e.target.value) })}
-                      className="w-full bg-white dark:bg-slate-900 border border-indigo-200 dark:border-indigo-800 rounded-xl p-2.5 text-xs font-bold text-indigo-600 dark:text-indigo-400"
-                    />
+                    <div>
+                      <label className="text-[11px] font-bold text-slate-700 dark:text-slate-300 block mb-1">Batas Respon AI / Bulan</label>
+                      <input
+                        type="number"
+                        required
+                        value={editingPlan.monthly_ai_limit ?? 1500}
+                        onChange={e => setEditingPlan({ ...editingPlan, monthly_ai_limit: Number(e.target.value) })}
+                        className="w-full bg-white dark:bg-slate-900 border border-indigo-200 dark:border-indigo-800 rounded-xl p-2.5 text-xs font-bold text-indigo-600 dark:text-indigo-400"
+                      />
+                    </div>
                   </div>
-                </div>
+                )}
               </div>
 
               <div>
